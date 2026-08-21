@@ -3,8 +3,8 @@
 Live per-process + per-interface network traffic monitor, built with eBPF (via [Aya](https://aya-rs.dev)) and Rust.
 
 - **Per-process traffic**: kprobes on `tcp_sendmsg`/`tcp_cleanup_rbuf`/`udp_sendmsg`/`udp_recvmsg`
-  attribute TX/RX bytes to the owning process (keyed by TGID). This is **system-wide** — sockets
-  aren't tied to a single NIC, so this table is not filtered by `-i`.
+  attribute TX/RX bytes to the owning process (keyed by TGID), tracked separately for TCP and UDP.
+  This is **system-wide** — sockets aren't tied to a single NIC, so this table is not filtered by `-i`.
 - **Interface totals**: an XDP program (ingress) + TC classifier (egress) count aggregate
   packets/bytes on the one interface passed via `-i`.
 

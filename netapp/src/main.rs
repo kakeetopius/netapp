@@ -189,20 +189,29 @@ fn build_state(
             }
             let mut traffic = ProcTraffic::default();
             for v in per_cpu.iter() {
-                traffic.tx_bytes += v.tx_bytes;
-                traffic.rx_bytes += v.rx_bytes;
+                traffic.tcp_tx_bytes += v.tcp_tx_bytes;
+                traffic.tcp_rx_bytes += v.tcp_rx_bytes;
+                traffic.udp_tx_bytes += v.udp_tx_bytes;
+                traffic.udp_rx_bytes += v.udp_rx_bytes;
             }
             let prev = prev_procs.get(&pid).copied().unwrap_or_default();
-            let tx_rate = traffic.tx_bytes.saturating_sub(prev.tx_bytes) as f64 / dt;
-            let rx_rate = traffic.rx_bytes.saturating_sub(prev.rx_bytes) as f64 / dt;
+            let tcp_tx_rate = traffic.tcp_tx_bytes.saturating_sub(prev.tcp_tx_bytes) as f64 / dt;
+            let tcp_rx_rate = traffic.tcp_rx_bytes.saturating_sub(prev.tcp_rx_bytes) as f64 / dt;
+            let udp_tx_rate = traffic.udp_tx_bytes.saturating_sub(prev.udp_tx_bytes) as f64 / dt;
+            let udp_rx_rate = traffic.udp_rx_bytes.saturating_sub(prev.udp_rx_bytes) as f64 / dt;
             let name = proc_resolver::process_name(pid).unwrap_or_else(|| "?".to_string());
+            let total_bytes = traffic.tcp_tx_bytes
+                + traffic.tcp_rx_bytes
+                + traffic.udp_tx_bytes
+                + traffic.udp_rx_bytes;
             procs.push(ProcRow {
                 pid,
                 name,
-                tx_bytes: traffic.tx_bytes,
-                rx_bytes: traffic.rx_bytes,
-                tx_rate,
-                rx_rate,
+                tcp_tx_rate,
+                tcp_rx_rate,
+                udp_tx_rate,
+                udp_rx_rate,
+                total_bytes,
             });
             prev_procs.insert(pid, traffic);
         }
@@ -224,7 +233,7 @@ fn build_state(
         }
     }
 
-    procs.sort_by_key(|p| std::cmp::Reverse(p.tx_bytes + p.rx_bytes));
+    procs.sort_by_key(|p| std::cmp::Reverse(p.total_bytes));
     procs.truncate(args.top);
 
     Ok(AppState {
