@@ -1,0 +1,12 @@
+[env]
+# The bpfel-unknown-none target has no prebuilt std, so building the eBPF
+# crate needs `-Z build-std=core`, which normally requires nightly. This
+# machine has the pacman `rust-src` package installed at the exact path
+# `-Z build-std` expects, so scoping RUSTC_BOOTSTRAP to just the eBPF crate
+# name unlocks the unstable flag on stable rustc without installing nightly.
+RUSTC_BOOTSTRAP = { value = "netapp-ebpf", force = false }
+
+[target."cfg(all())"]
+# eBPF loading (kprobes/XDP/TC) needs root; this machine has no passwordless
+# sudo, so `cargo run` prompts interactively via sudo.
+runner = "sudo -E"
