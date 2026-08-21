@@ -6,7 +6,7 @@ use std::collections::HashMap as StdHashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use aya::maps::{HashMap as AyaHashMap, PerCpuArray};
+use aya::maps::{PerCpuArray, PerCpuHashMap};
 use aya::programs::{tc, KProbe, SchedClassifier, TcAttachType, Xdp, XdpMode};
 use clap::Parser;
 use netapp_common::{IfaceCounters, ProcTraffic};
@@ -28,9 +28,9 @@ async fn main() -> anyhow::Result<()> {
         log::warn!("failed to initialize eBPF logger: {e}");
     }
 
-    attach_kprobe(&mut ebpf, "kprobe_tcp_sendmsg", "tcp_sendmsg")?;
+    attach_kprobe(&mut ebpf, "kretprobe_tcp_sendmsg", "tcp_sendmsg")?;
     attach_kprobe(&mut ebpf, "kprobe_tcp_cleanup_rbuf", "tcp_cleanup_rbuf")?;
-    attach_kprobe(&mut ebpf, "kprobe_udp_sendmsg", "udp_sendmsg")?;
+    attach_kprobe(&mut ebpf, "kretprobe_udp_sendmsg", "udp_sendmsg")?;
     attach_kprobe(&mut ebpf, "kretprobe_udp_recvmsg", "udp_recvmsg")?;
 
     let xdp: &mut Xdp = ebpf.program_mut("xdp_ingress").unwrap().try_into()?;
@@ -103,6 +103,9 @@ async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result
     });
 
     let mut prev_iface = IfaceCounters::default();
+    // Keyed by TGID only, not TGID + process start time (see the
+    // PROC_TRAFFIC doc comment in netapp-ebpf/src/main.rs) -- a TGID
+    // recycled within one reap interval could inherit stale counters.
     let mut prev_procs: StdHashMap<u32, ProcTraffic> = StdHashMap::new();
     let mut last_tick = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
@@ -175,14 +178,19 @@ fn build_state(
     let mut procs = Vec::new();
     let mut seen: Vec<u32> = Vec::new();
     {
-        let proc_map: AyaHashMap<_, u32, ProcTraffic> = AyaHashMap::try_from(
+        let proc_map: PerCpuHashMap<_, u32, ProcTraffic> = PerCpuHashMap::try_from(
             ebpf.map("PROC_TRAFFIC").context("PROC_TRAFFIC map missing")?,
         )?;
         for entry in proc_map.iter() {
-            let (pid, traffic) = entry?;
+            let (pid, per_cpu) = entry?;
             seen.push(pid);
             if !proc_resolver::is_alive(pid) {
                 continue;
+            }
+            let mut traffic = ProcTraffic::default();
+            for v in per_cpu.iter() {
+                traffic.tx_bytes += v.tx_bytes;
+                traffic.rx_bytes += v.rx_bytes;
             }
             let prev = prev_procs.get(&pid).copied().unwrap_or_default();
             let tx_rate = traffic.tx_bytes.saturating_sub(prev.tx_bytes) as f64 / dt;
@@ -206,7 +214,7 @@ fn build_state(
         .filter(|pid| !proc_resolver::is_alive(*pid))
         .collect();
     if !dead.is_empty() {
-        let mut proc_map_mut: AyaHashMap<_, u32, ProcTraffic> = AyaHashMap::try_from(
+        let mut proc_map_mut: PerCpuHashMap<_, u32, ProcTraffic> = PerCpuHashMap::try_from(
             ebpf.map_mut("PROC_TRAFFIC")
                 .context("PROC_TRAFFIC map missing")?,
         )?;

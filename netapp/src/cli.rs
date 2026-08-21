@@ -11,7 +11,7 @@ pub struct Args {
     pub interface: String,
 
     /// Dashboard refresh interval, in milliseconds.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
     pub interval: u64,
 
     /// Number of process rows to show, sorted by total traffic.

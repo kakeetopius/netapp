@@ -13,9 +13,21 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn init() -> anyhow::Result<Tui> {
     enable_raw_mode()?;
+
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
+
+    match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => Ok(terminal),
+        Err(e) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(e.into())
+        }
+    }
 }
 
 pub fn restore() -> anyhow::Result<()> {

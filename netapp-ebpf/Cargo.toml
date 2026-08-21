@@ -13,18 +13,6 @@ aya-log-ebpf = { workspace = true }
 name = "netapp"
 path = "src/main.rs"
 
-[profile.dev]
-opt-level = 3
-debug = false
-debug-assertions = false
-overflow-checks = false
-lto = true
-panic = "abort"
-
-[profile.release]
-opt-level = 3
-debug = false
-debug-assertions = false
-overflow-checks = false
-lto = true
-panic = "abort"
+# Cargo ignores [profile.*] tables in non-root workspace members; the actual
+# release settings for this crate live in the root Cargo.toml's
+# [profile.release.package.netapp-ebpf].
