@@ -1,12 +1,15 @@
 #![no_std]
 
-/// Cumulative TCP+UDP bytes attributed to a process (keyed by TGID, i.e. the
-/// pid as seen in /proc). System-wide, not scoped to any single interface.
+/// Cumulative TCP and UDP bytes attributed to a process (keyed by TGID,
+/// i.e. the pid as seen in /proc), tracked separately per protocol.
+/// System-wide, not scoped to any single interface.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct ProcTraffic {
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
+    pub tcp_tx_bytes: u64,
+    pub tcp_rx_bytes: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
 }
 
 #[cfg(feature = "user")]

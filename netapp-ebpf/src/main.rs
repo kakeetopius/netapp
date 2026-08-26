@@ -37,22 +37,46 @@ static PROC_TRAFFIC: PerCpuHashMap<u32, ProcTraffic> = PerCpuHashMap::with_max_e
 #[map]
 static IFACE_STATS: PerCpuArray<IfaceCounters> = PerCpuArray::with_max_entries(1, 0);
 
-fn update_proc(tgid: u32, tx: u64, rx: u64) {
+// A compile-time-constant zero value, not a runtime-constructed struct
+// literal: rustc const-evaluates and promotes this into a `.rodata` entry,
+// so inserting it needs no runtime initialization of the 32-byte struct.
+// Building a *partial* literal at runtime instead (e.g. `ProcTraffic { tcp_tx_bytes:
+// tx, ..everything else: 0 }`) gets merged by LLVM into a `memset` call over
+// the zeroed fields, which the BPF backend can't lower ("call to built-in
+// function 'memset' is not supported"). Always going through this zero
+// constant on first-insert, then mutating fields individually through the
+// pointer (same as the already-present case), avoids that entirely.
+const ZERO_TRAFFIC: ProcTraffic = ProcTraffic {
+    tcp_tx_bytes: 0,
+    tcp_rx_bytes: 0,
+    udp_tx_bytes: 0,
+    udp_rx_bytes: 0,
+};
+
+fn ensure_entry(tgid: u32) {
+    if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none() {
+        let _ = PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0);
+    }
+}
+
+fn update_tcp(tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(tgid);
     unsafe {
         if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
-            (*p).tx_bytes += tx;
-            (*p).rx_bytes += rx;
-            return;
+            (*p).tcp_tx_bytes += tx;
+            (*p).tcp_rx_bytes += rx;
         }
     }
-    let _ = PROC_TRAFFIC.insert(
-        &tgid,
-        &ProcTraffic {
-            tx_bytes: tx,
-            rx_bytes: rx,
-        },
-        0,
-    );
+}
+
+fn update_udp(tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(tgid);
+    unsafe {
+        if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
+            (*p).udp_tx_bytes += tx;
+            (*p).udp_rx_bytes += rx;
+        }
+    }
 }
 
 // --- TCP ---
@@ -63,7 +87,7 @@ pub fn kretprobe_tcp_sendmsg(ctx: RetProbeContext) -> u32 {
     // not the requested size -- a failed/short send shouldn't count as TX.
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_proc(ctx.tgid(), ret as u64, 0);
+        update_tcp(ctx.tgid(), ret as u64, 0);
     }
     0
 }
@@ -73,7 +97,7 @@ pub fn kprobe_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     // void tcp_cleanup_rbuf(struct sock *sk, int copied)
     if let Some(copied) = ctx.arg::<i32>(1) {
         if copied > 0 {
-            update_proc(ctx.tgid(), 0, copied as u64);
+            update_tcp(ctx.tgid(), 0, copied as u64);
         }
     }
     0
@@ -86,7 +110,7 @@ pub fn kretprobe_udp_sendmsg(ctx: RetProbeContext) -> u32 {
     // int udp_sendmsg(...); return value is bytes actually sent (or -errno).
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_proc(ctx.tgid(), ret as u64, 0);
+        update_udp(ctx.tgid(), ret as u64, 0);
     }
     0
 }
@@ -96,7 +120,7 @@ pub fn kretprobe_udp_recvmsg(ctx: RetProbeContext) -> u32 {
     // int udp_recvmsg(...); return value is bytes received (or -errno)
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_proc(ctx.tgid(), 0, ret as u64);
+        update_udp(ctx.tgid(), 0, ret as u64);
     }
     0
 }

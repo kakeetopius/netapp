@@ -10,3 +10,11 @@ RUSTC_BOOTSTRAP = { value = "netapp-ebpf", force = false }
 # eBPF loading (kprobes/XDP/TC) needs root; this machine has no passwordless
 # sudo, so `cargo run` prompts interactively via sudo.
 runner = "sudo -E"
+
+[unstable]
+# bpfel-unknown-none is a freestanding target with no libc, so LLVM's
+# memset/memcpy/memmove intrinsic lowering has nothing to call into --
+# bpf-linker reports this as "call to built-in function 'memset' is not
+# supported". compiler_builtins ships Rust implementations of these, but
+# they're off by default; this turns them on for the eBPF crate's build-std.
+build-std-features = ["compiler-builtins-mem"]

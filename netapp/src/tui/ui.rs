@@ -57,10 +57,10 @@ fn draw_proc_table(frame: &mut Frame, area: Rect, state: &AppState) {
     let header = Row::new(vec![
         Cell::from("PID"),
         Cell::from("PROCESS"),
-        Cell::from("TX/s"),
-        Cell::from("RX/s"),
-        Cell::from("TOTAL TX"),
-        Cell::from("TOTAL RX"),
+        Cell::from("TCP TX/s"),
+        Cell::from("TCP RX/s"),
+        Cell::from("UDP TX/s"),
+        Cell::from("UDP RX/s"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -68,10 +68,10 @@ fn draw_proc_table(frame: &mut Frame, area: Rect, state: &AppState) {
         Row::new(vec![
             Cell::from(p.pid.to_string()),
             Cell::from(p.name.clone()),
-            Cell::from(format!("{}/s", human_bytes(p.tx_rate))),
-            Cell::from(format!("{}/s", human_bytes(p.rx_rate))),
-            Cell::from(human_bytes(p.tx_bytes as f64)),
-            Cell::from(human_bytes(p.rx_bytes as f64)),
+            Cell::from(format!("{}/s", human_bytes(p.tcp_tx_rate))),
+            Cell::from(format!("{}/s", human_bytes(p.tcp_rx_rate))),
+            Cell::from(format!("{}/s", human_bytes(p.udp_tx_rate))),
+            Cell::from(format!("{}/s", human_bytes(p.udp_rx_rate))),
         ])
     });
 
