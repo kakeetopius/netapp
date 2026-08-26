@@ -16,6 +16,24 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    # The eBPF crate (netapp-ebpf) is cross-compiled from netapp/build.rs via
+    # aya-build, which shells out to a specific nightly toolchain pinned
+    # there (see netapp/build.rs and README.md) because its bundled LLVM
+    # must match bpf-linker's. Keep this version pin in lockstep with the
+    # one in netapp/build.rs and the bpf-linker version below.
+    - name: Install nightly toolchain for eBPF build
+      run: rustup toolchain install nightly-2026-06-01 --profile minimal --component rust-src
+
+    # bpf-linker 0.10.4 is the last release targeting LLVM 22, matching
+    # nightly-2026-06-01's bundled LLVM. Newer bpf-linker releases target
+    # LLVM 23 and fail with "ERROR llvm: Invalid record" against this
+    # toolchain.
+    - name: Install bpf-linker
+      uses: taiki-e/install-action@v2
+      with:
+        tool: bpf-linker@0.10.4
+
     - name: Build
       run: cargo build --verbose
     - name: Run tests
