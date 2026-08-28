@@ -80,6 +80,10 @@ pkexec tc qdisc del dev wlan0 clsact
 ## Caveats
 
 - The kprobe targets (`tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg`) are
-  internal, non-exported kernel symbols verified against this machine's kernel
-  (`7.1.8-1-cachyos`) via `bpftool btf dump file /sys/kernel/btf/vmlinux`. A kernel upgrade could
-  rename or inline them; re-verify with the same command if probes fail to attach.
+  internal, non-exported kernel symbols verified against this machine's kernel via
+  `bpftool btf dump file /sys/kernel/btf/vmlinux`. A kernel upgrade could rename or inline them,
+  *or* change their argument count/order -- `netapp-ebpf/src/main.rs`'s `ctx.arg::<i32>(N)` calls
+  (e.g. `udp_recvmsg`'s `flags` at index 3) assume this same, currently-verified signature and
+  aren't portable across kernel versions where it differs (older kernels had an extra `noblock`
+  parameter before `flags`, for instance). Re-verify both the symbol and its `FUNC_PROTO` arg
+  list with the same command if probes fail to attach or start reading the wrong argument.
