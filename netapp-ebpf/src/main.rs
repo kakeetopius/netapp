@@ -9,7 +9,6 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext, TcContext, XdpContext},
     EbpfContext,
 };
-use aya_log_ebpf::warn;
 use netapp_common::{IfaceCounters, ProcTraffic};
 
 /// System-wide per-process traffic, keyed by TGID (the pid as seen in
@@ -39,6 +38,19 @@ static PROC_TRAFFIC: PerCpuHashMap<u32, ProcTraffic> = PerCpuHashMap::with_max_e
 #[map]
 static IFACE_STATS: PerCpuArray<IfaceCounters> = PerCpuArray::with_max_entries(1, 0);
 
+/// Counts tgids dropped because `PROC_TRAFFIC` was full (see `ensure_entry`
+/// below), so userspace can at least surface *that* traffic is going
+/// unaccounted rather than this failing completely silently. Not logged via
+/// aya-log's `warn!` from here: that macro pulls in the AYA_LOGS ring buffer
+/// map, and calling it from a function inlined into several different BPF
+/// programs (as `ensure_entry` is, via `update_tcp`/`update_udp`) hits a map
+/// relocation bug in this project's aya version pinning -- BPF_PROG_LOAD
+/// fails on the very first probe with "fd N is not pointing to valid
+/// bpf_map" even from a single, non-shared call site. A plain counter map
+/// sidesteps it entirely.
+#[map]
+static PROC_TRAFFIC_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 // A compile-time-constant zero value, not a runtime-constructed struct
 // literal: rustc const-evaluates and promotes this into a `.rodata` entry,
 // so inserting it needs no runtime initialization of the 32-byte struct.
@@ -55,19 +67,20 @@ const ZERO_TRAFFIC: ProcTraffic = ProcTraffic {
     udp_rx_bytes: 0,
 };
 
-fn ensure_entry(ctx: &impl EbpfContext, tgid: u32) {
+fn ensure_entry(tgid: u32) {
     if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none()
         && PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0).is_err()
     {
         // Most likely the 10240-entry cap is full (heavy process churn
-        // between userspace reap passes). Made visible via the eBPF
-        // logger rather than silently dropping this tgid's traffic.
-        warn!(ctx, "PROC_TRAFFIC full, dropping tgid {}", tgid);
+        // between userspace reap passes).
+        if let Some(c) = PROC_TRAFFIC_DROPPED.get_ptr_mut(0) {
+            unsafe { *c += 1 };
+        }
     }
 }
 
-fn update_tcp(ctx: &impl EbpfContext, tgid: u32, tx: u64, rx: u64) {
-    ensure_entry(ctx, tgid);
+fn update_tcp(tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(tgid);
     unsafe {
         if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
             (*p).tcp_tx_bytes += tx;
@@ -76,8 +89,8 @@ fn update_tcp(ctx: &impl EbpfContext, tgid: u32, tx: u64, rx: u64) {
     }
 }
 
-fn update_udp(ctx: &impl EbpfContext, tgid: u32, tx: u64, rx: u64) {
-    ensure_entry(ctx, tgid);
+fn update_udp(tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(tgid);
     unsafe {
         if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
             (*p).udp_tx_bytes += tx;
@@ -94,7 +107,7 @@ pub fn kretprobe_tcp_sendmsg(ctx: RetProbeContext) -> u32 {
     // not the requested size -- a failed/short send shouldn't count as TX.
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_tcp(&ctx, ctx.tgid(), ret as u64, 0);
+        update_tcp(ctx.tgid(), ret as u64, 0);
     }
     0
 }
@@ -104,7 +117,7 @@ pub fn kprobe_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     // void tcp_cleanup_rbuf(struct sock *sk, int copied)
     if let Some(copied) = ctx.arg::<i32>(1) {
         if copied > 0 {
-            update_tcp(&ctx, ctx.tgid(), 0, copied as u64);
+            update_tcp(ctx.tgid(), 0, copied as u64);
         }
     }
     0
@@ -117,7 +130,7 @@ pub fn kretprobe_udp_sendmsg(ctx: RetProbeContext) -> u32 {
     // int udp_sendmsg(...); return value is bytes actually sent (or -errno).
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_udp(&ctx, ctx.tgid(), ret as u64, 0);
+        update_udp(ctx.tgid(), ret as u64, 0);
     }
     0
 }
@@ -158,7 +171,7 @@ pub fn kretprobe_udp_recvmsg(ctx: RetProbeContext) -> u32 {
     // int udp_recvmsg(...); return value is bytes received (or -errno)
     let ret: i32 = ctx.ret();
     if ret > 0 && !peeked {
-        update_udp(&ctx, ctx.tgid(), 0, ret as u64);
+        update_udp(ctx.tgid(), 0, ret as u64);
     }
     0
 }

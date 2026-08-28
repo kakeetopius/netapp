@@ -46,12 +46,13 @@ cargo build --release
 
 ## Run
 
-Loading kprobes/XDP/TC needs root, and there's no passwordless sudo on this machine, so
-`.cargo/config.toml` sets a `sudo -E` runner for `cargo run`. To run the built release binary
-directly:
+Loading kprobes/XDP/TC needs root. `sudo` on this machine goes through fingerprint auth, which
+doesn't work in non-interactive contexts (e.g. `cargo test` invoking the same runner), so
+`.cargo/config.toml` sets a `pkexec` runner for `cargo run` instead. To run the built release
+binary directly:
 
 ```bash
-sudo -E ./target/release/netapp -i wlan0 --interval 500 --top 15
+pkexec --keep-cwd env RUST_LOG=info ./target/release/netapp -i wlan0 --interval 500 --top 15
 ```
 
 Press `q` or Ctrl-C to quit. On exit, if the interface didn't already have a `clsact` qdisc, one
@@ -60,7 +61,7 @@ automatically since something else might be relying on it). Clean it up manually
 need it:
 
 ```bash
-sudo tc qdisc del dev wlan0 clsact
+pkexec tc qdisc del dev wlan0 clsact
 ```
 
 ## Verifying it works
@@ -73,8 +74,8 @@ sudo tc qdisc del dev wlan0 clsact
 - Generate loopback traffic (`ping -c 5 127.0.0.1`) while monitoring `wlan0` — it should appear
   in the process table but *not* move the interface panel, which demonstrates the
   system-wide-vs-interface-scoped distinction described above.
-- After quitting: `sudo bpftool prog list` / `sudo bpftool link list` should show nothing left
-  attached.
+- After quitting: `pkexec bpftool prog list` / `pkexec bpftool link list` should show nothing
+  left attached.
 
 ## Caveats
 
