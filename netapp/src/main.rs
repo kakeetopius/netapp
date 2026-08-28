@@ -94,6 +94,27 @@ fn attach_kprobe(ebpf: &mut aya::Ebpf, prog_name: &str, kernel_fn: &str) -> anyh
     Ok(())
 }
 
+/// Reads a single-slot `PerCpuArray<u64>` drop counter and logs a warning
+/// (with `{n}` in `message` replaced by the delta) if it grew since the
+/// last tick.
+fn report_dropped_counter(
+    ebpf: &aya::Ebpf,
+    map_name: &str,
+    prev: &mut u64,
+    message: &str,
+) -> anyhow::Result<()> {
+    let map: PerCpuArray<_, u64> = PerCpuArray::try_from(
+        ebpf.map(map_name)
+            .with_context(|| format!("{map_name} map missing"))?,
+    )?;
+    let cur: u64 = map.get(&0, 0)?.iter().sum();
+    if cur > *prev {
+        log::warn!("{}", message.replace("{n}", &(cur - *prev).to_string()));
+    }
+    *prev = cur;
+    Ok(())
+}
+
 async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result<()> {
     let mut terminal = tui::init()?;
 
@@ -118,6 +139,7 @@ async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result
     // recycled within one reap interval could inherit stale counters.
     let mut prev_procs: StdHashMap<u32, ProcTraffic> = StdHashMap::new();
     let mut prev_dropped: u64 = 0;
+    let mut prev_peek_dropped: u64 = 0;
     let mut last_tick = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
 
@@ -128,7 +150,7 @@ async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result
                 let dt = now.duration_since(last_tick).as_secs_f64().max(0.001);
                 last_tick = now;
 
-                match build_state(ebpf, args, &mut prev_iface, &mut prev_procs, &mut prev_dropped, dt) {
+                match build_state(ebpf, args, &mut prev_iface, &mut prev_procs, &mut prev_dropped, &mut prev_peek_dropped, dt) {
                     Ok(state) => {
                         if let Err(e) = terminal.draw(|f| tui::ui::draw(f, &state)) {
                             break Err(e.into());
@@ -161,20 +183,21 @@ fn build_state(
     prev_iface: &mut IfaceCounters,
     prev_procs: &mut StdHashMap<u32, ProcTraffic>,
     prev_dropped: &mut u64,
+    prev_peek_dropped: &mut u64,
     dt: f64,
 ) -> anyhow::Result<AppState> {
-    let dropped_map: PerCpuArray<_, u64> = PerCpuArray::try_from(
-        ebpf.map("PROC_TRAFFIC_DROPPED")
-            .context("PROC_TRAFFIC_DROPPED map missing")?,
+    report_dropped_counter(
+        ebpf,
+        "PROC_TRAFFIC_DROPPED",
+        prev_dropped,
+        "PROC_TRAFFIC map full: {n} process(es) had traffic go unaccounted since last tick",
     )?;
-    let cur_dropped: u64 = dropped_map.get(&0, 0)?.iter().sum();
-    if cur_dropped > *prev_dropped {
-        log::warn!(
-            "PROC_TRAFFIC map full: {} process(es) had traffic go unaccounted since last tick",
-            cur_dropped - *prev_dropped
-        );
-    }
-    *prev_dropped = cur_dropped;
+    report_dropped_counter(
+        ebpf,
+        "UDP_RECV_PEEK_DROPPED",
+        prev_peek_dropped,
+        "UDP_RECV_PEEK map full: {n} MSG_PEEK read(s) may have been double-counted since last tick",
+    )?;
 
     let iface_map: PerCpuArray<_, IfaceCounters> = PerCpuArray::try_from(
         ebpf.map("IFACE_STATS").context("IFACE_STATS map missing")?,

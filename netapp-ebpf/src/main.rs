@@ -148,13 +148,26 @@ const MSG_PEEK: i32 = 2;
 #[map]
 static UDP_RECV_PEEK: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
 
+/// Counts `UDP_RECV_PEEK` insert failures (map full -- 1024+ MSG_PEEK calls
+/// in flight at once system-wide). When that happens the kretprobe below
+/// can't tell the call was a peek and counts it as a real read, so a
+/// follow-up real read of the same datagram double-counts it -- the exact
+/// bug `UDP_RECV_PEEK` exists to avoid. Surfaced to userspace the same way
+/// as `PROC_TRAFFIC_DROPPED` rather than silently dropped.
+#[map]
+static UDP_RECV_PEEK_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 #[kprobe]
 pub fn kprobe_udp_recvmsg(ctx: ProbeContext) -> u32 {
     // int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
     if let Some(flags) = ctx.arg::<i32>(3) {
         if flags & MSG_PEEK != 0 {
             let pid_tgid = bpf_get_current_pid_tgid();
-            let _ = UDP_RECV_PEEK.insert(&pid_tgid, &1u8, 0);
+            if UDP_RECV_PEEK.insert(&pid_tgid, &1u8, 0).is_err() {
+                if let Some(c) = UDP_RECV_PEEK_DROPPED.get_ptr_mut(0) {
+                    unsafe { *c += 1 };
+                }
+            }
         }
     }
     0
