@@ -74,8 +74,10 @@ pkexec tc qdisc del dev wlan0 clsact
 - Generate loopback traffic (`ping -c 5 127.0.0.1`) while monitoring `wlan0` — it should appear
   in the process table but *not* move the interface panel, which demonstrates the
   system-wide-vs-interface-scoped distinction described above.
-- After quitting: `pkexec bpftool prog list` / `pkexec bpftool link list` should show nothing
-  left attached.
+- While `netapp` is running: `pkexec bpftool prog list` / `pkexec bpftool link list` show its
+  programs/links with `pids netapp(<pid>)` -- note their IDs. After quitting, those specific IDs
+  should be gone (a bare "should show nothing left attached" isn't right on a system that already
+  has other, unrelated BPF programs loaded -- e.g. systemd's -- which is normal and expected).
 
 ## Caveats
 
