@@ -46,12 +46,13 @@ cargo build --release
 
 ## Run
 
-Loading kprobes/XDP/TC needs root, and there's no passwordless sudo on this machine, so
-`.cargo/config.toml` sets a `sudo -E` runner for `cargo run`. To run the built release binary
-directly:
+Loading kprobes/XDP/TC needs root. `sudo` on this machine goes through fingerprint auth, which
+doesn't work in non-interactive contexts (e.g. `cargo test` invoking the same runner), so
+`.cargo/config.toml` sets a `pkexec` runner for `cargo run` instead. To run the built release
+binary directly:
 
 ```bash
-sudo -E ./target/release/netapp -i wlan0 --interval 500 --top 15
+pkexec --keep-cwd env RUST_LOG=info ./target/release/netapp -i wlan0 --interval 500 --top 15
 ```
 
 Press `q` or Ctrl-C to quit. On exit, if the interface didn't already have a `clsact` qdisc, one
@@ -60,7 +61,7 @@ automatically since something else might be relying on it). Clean it up manually
 need it:
 
 ```bash
-sudo tc qdisc del dev wlan0 clsact
+pkexec tc qdisc del dev wlan0 clsact
 ```
 
 ## Verifying it works
@@ -73,12 +74,18 @@ sudo tc qdisc del dev wlan0 clsact
 - Generate loopback traffic (`ping -c 5 127.0.0.1`) while monitoring `wlan0` — it should appear
   in the process table but *not* move the interface panel, which demonstrates the
   system-wide-vs-interface-scoped distinction described above.
-- After quitting: `sudo bpftool prog list` / `sudo bpftool link list` should show nothing left
-  attached.
+- While `netapp` is running: `pkexec bpftool prog list` / `pkexec bpftool link list` show its
+  programs/links with `pids netapp(<pid>)` -- note their IDs. After quitting, those specific IDs
+  should be gone (a bare "should show nothing left attached" isn't right on a system that already
+  has other, unrelated BPF programs loaded -- e.g. systemd's -- which is normal and expected).
 
 ## Caveats
 
 - The kprobe targets (`tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`, `udp_recvmsg`) are
-  internal, non-exported kernel symbols verified against this machine's kernel
-  (`7.1.8-1-cachyos`) via `bpftool btf dump file /sys/kernel/btf/vmlinux`. A kernel upgrade could
-  rename or inline them; re-verify with the same command if probes fail to attach.
+  internal, non-exported kernel symbols verified against this machine's kernel via
+  `bpftool btf dump file /sys/kernel/btf/vmlinux`. A kernel upgrade could rename or inline them,
+  *or* change their argument count/order -- `netapp-ebpf/src/main.rs`'s `ctx.arg::<i32>(N)` calls
+  (e.g. `udp_recvmsg`'s `flags` at index 3) assume this same, currently-verified signature and
+  aren't portable across kernel versions where it differs (older kernels had an extra `noblock`
+  parameter before `flags`, for instance). Re-verify both the symbol and its `FUNC_PROTO` arg
+  list with the same command if probes fail to attach or start reading the wrong argument.

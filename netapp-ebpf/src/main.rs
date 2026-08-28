@@ -3,8 +3,9 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_PIPE},
+    helpers::bpf_get_current_pid_tgid,
     macros::{classifier, kprobe, kretprobe, map, xdp},
-    maps::{PerCpuArray, PerCpuHashMap},
+    maps::{HashMap, PerCpuArray, PerCpuHashMap},
     programs::{ProbeContext, RetProbeContext, TcContext, XdpContext},
     EbpfContext,
 };
@@ -37,6 +38,19 @@ static PROC_TRAFFIC: PerCpuHashMap<u32, ProcTraffic> = PerCpuHashMap::with_max_e
 #[map]
 static IFACE_STATS: PerCpuArray<IfaceCounters> = PerCpuArray::with_max_entries(1, 0);
 
+/// Counts tgids dropped because `PROC_TRAFFIC` was full (see `ensure_entry`
+/// below), so userspace can at least surface *that* traffic is going
+/// unaccounted rather than this failing completely silently. Not logged via
+/// aya-log's `warn!` from here: that macro pulls in the AYA_LOGS ring buffer
+/// map, and calling it from a function inlined into several different BPF
+/// programs (as `ensure_entry` is, via `update_tcp`/`update_udp`) hits a map
+/// relocation bug in this project's aya version pinning -- BPF_PROG_LOAD
+/// fails on the very first probe with "fd N is not pointing to valid
+/// bpf_map" even from a single, non-shared call site. A plain counter map
+/// sidesteps it entirely.
+#[map]
+static PROC_TRAFFIC_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 // A compile-time-constant zero value, not a runtime-constructed struct
 // literal: rustc const-evaluates and promotes this into a `.rodata` entry,
 // so inserting it needs no runtime initialization of the 32-byte struct.
@@ -54,8 +68,14 @@ const ZERO_TRAFFIC: ProcTraffic = ProcTraffic {
 };
 
 fn ensure_entry(tgid: u32) {
-    if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none() {
-        let _ = PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0);
+    if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none()
+        && PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0).is_err()
+    {
+        // Most likely the 10240-entry cap is full (heavy process churn
+        // between userspace reap passes).
+        if let Some(c) = PROC_TRAFFIC_DROPPED.get_ptr_mut(0) {
+            unsafe { *c += 1 };
+        }
     }
 }
 
@@ -115,11 +135,55 @@ pub fn kretprobe_udp_sendmsg(ctx: RetProbeContext) -> u32 {
     0
 }
 
+/// MSG_PEEK, from `<linux/socket.h>`.
+const MSG_PEEK: i32 = 2;
+
+/// `udp_recvmsg`'s return value counts bytes copied to userspace even for a
+/// MSG_PEEK read, which doesn't dequeue the datagram -- the caller typically
+/// peeks it, then reads it again for real, and a naive kretprobe would count
+/// that datagram's bytes twice. This map lets the kretprobe below know
+/// whether the call it's returning from was a peek, keyed by pid_tgid (each
+/// thread's own in-flight call) since concurrent recvmsg calls from other
+/// threads/processes must not interfere with each other.
+#[map]
+static UDP_RECV_PEEK: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Counts `UDP_RECV_PEEK` insert failures (map full -- 1024+ MSG_PEEK calls
+/// in flight at once system-wide). When that happens the kretprobe below
+/// can't tell the call was a peek and counts it as a real read, so a
+/// follow-up real read of the same datagram double-counts it -- the exact
+/// bug `UDP_RECV_PEEK` exists to avoid. Surfaced to userspace the same way
+/// as `PROC_TRAFFIC_DROPPED` rather than silently dropped.
+#[map]
+static UDP_RECV_PEEK_DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+#[kprobe]
+pub fn kprobe_udp_recvmsg(ctx: ProbeContext) -> u32 {
+    // int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+    if let Some(flags) = ctx.arg::<i32>(3) {
+        if flags & MSG_PEEK != 0 {
+            let pid_tgid = bpf_get_current_pid_tgid();
+            if UDP_RECV_PEEK.insert(&pid_tgid, &1u8, 0).is_err() {
+                if let Some(c) = UDP_RECV_PEEK_DROPPED.get_ptr_mut(0) {
+                    unsafe { *c += 1 };
+                }
+            }
+        }
+    }
+    0
+}
+
 #[kretprobe]
 pub fn kretprobe_udp_recvmsg(ctx: RetProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let peeked = UDP_RECV_PEEK.get_ptr(&pid_tgid).is_some();
+    if peeked {
+        let _ = UDP_RECV_PEEK.remove(&pid_tgid);
+    }
+
     // int udp_recvmsg(...); return value is bytes received (or -errno)
     let ret: i32 = ctx.ret();
-    if ret > 0 {
+    if ret > 0 && !peeked {
         update_udp(ctx.tgid(), 0, ret as u64);
     }
     0

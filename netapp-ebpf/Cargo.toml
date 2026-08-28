@@ -7,7 +7,13 @@ license.workspace = true
 [dependencies]
 netapp-common = { path = "../netapp-common" }
 aya-ebpf = { workspace = true }
-aya-log-ebpf = { workspace = true }
+# Deliberately not using aya-log-ebpf: its `warn!`/`info!`/etc. macros pull
+# in the AYA_LOGS ring buffer map, and calling one from a function inlined
+# into several different BPF programs (as any shared helper here would be --
+# see netapp-ebpf/src/main.rs's PROC_TRAFFIC_DROPPED doc comment) hits a map
+# relocation bug in this project's aya version pinning: BPF_PROG_LOAD fails
+# on the very first probe with "fd N is not pointing to valid bpf_map", even
+# from a single, non-shared call site.
 
 [[bin]]
 name = "netapp"

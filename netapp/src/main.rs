@@ -24,13 +24,10 @@ async fn main() -> anyhow::Result<()> {
         "/netapp"
     )))?;
 
-    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        log::warn!("failed to initialize eBPF logger: {e}");
-    }
-
     attach_kprobe(&mut ebpf, "kretprobe_tcp_sendmsg", "tcp_sendmsg")?;
     attach_kprobe(&mut ebpf, "kprobe_tcp_cleanup_rbuf", "tcp_cleanup_rbuf")?;
     attach_kprobe(&mut ebpf, "kretprobe_udp_sendmsg", "udp_sendmsg")?;
+    attach_kprobe(&mut ebpf, "kprobe_udp_recvmsg", "udp_recvmsg")?;
     attach_kprobe(&mut ebpf, "kretprobe_udp_recvmsg", "udp_recvmsg")?;
 
     let xdp: &mut Xdp = ebpf.program_mut("xdp_ingress").unwrap().try_into()?;
@@ -43,22 +40,35 @@ async fn main() -> anyhow::Result<()> {
         Ok(()) => created_clsact = true,
         Err(e) => log::debug!("clsact qdisc not added (may already exist): {e}"),
     }
+
+    // Everything from here on runs after the clsact qdisc may already have
+    // been created, so its result (including a failure attaching the TC
+    // program) is captured rather than propagated with `?` -- otherwise an
+    // early return would skip the "left the clsact qdisc in place" note
+    // below and leave it on the interface with no indication to the user.
+    let result = attach_tc_and_run_dashboard(&mut ebpf, &args).await;
+
+    if created_clsact {
+        eprintln!(
+            "note: left the clsact qdisc on {} in place; remove it with `pkexec tc qdisc del dev {} clsact` if you don't need it",
+            args.interface, args.interface
+        );
+    }
+
+    result
+}
+
+async fn attach_tc_and_run_dashboard(
+    ebpf: &mut aya::Ebpf,
+    args: &cli::Args,
+) -> anyhow::Result<()> {
     let tc_prog: &mut SchedClassifier = ebpf.program_mut("tc_egress").unwrap().try_into()?;
     tc_prog.load()?;
     tc_prog
         .attach(&args.interface, TcAttachType::Egress)
         .context("failed to attach TC egress program")?;
 
-    let result = run_dashboard(&mut ebpf, &args).await;
-
-    if created_clsact {
-        eprintln!(
-            "note: left the clsact qdisc on {} in place; remove it with `sudo tc qdisc del dev {} clsact` if you don't need it",
-            args.interface, args.interface
-        );
-    }
-
-    result
+    run_dashboard(ebpf, args).await
 }
 
 fn bump_memlock_rlimit() {
@@ -81,6 +91,27 @@ fn attach_kprobe(ebpf: &mut aya::Ebpf, prog_name: &str, kernel_fn: &str) -> anyh
     program
         .attach(kernel_fn, 0)
         .with_context(|| format!("failed to attach {prog_name} to kernel fn {kernel_fn}"))?;
+    Ok(())
+}
+
+/// Reads a single-slot `PerCpuArray<u64>` drop counter and logs a warning
+/// (with `{n}` in `message` replaced by the delta) if it grew since the
+/// last tick.
+fn report_dropped_counter(
+    ebpf: &aya::Ebpf,
+    map_name: &str,
+    prev: &mut u64,
+    message: &str,
+) -> anyhow::Result<()> {
+    let map: PerCpuArray<_, u64> = PerCpuArray::try_from(
+        ebpf.map(map_name)
+            .with_context(|| format!("{map_name} map missing"))?,
+    )?;
+    let cur: u64 = map.get(&0, 0)?.iter().sum();
+    if cur > *prev {
+        log::warn!("{}", message.replace("{n}", &(cur - *prev).to_string()));
+    }
+    *prev = cur;
     Ok(())
 }
 
@@ -107,6 +138,8 @@ async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result
     // PROC_TRAFFIC doc comment in netapp-ebpf/src/main.rs) -- a TGID
     // recycled within one reap interval could inherit stale counters.
     let mut prev_procs: StdHashMap<u32, ProcTraffic> = StdHashMap::new();
+    let mut prev_dropped: u64 = 0;
+    let mut prev_peek_dropped: u64 = 0;
     let mut last_tick = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
 
@@ -117,7 +150,7 @@ async fn run_dashboard(ebpf: &mut aya::Ebpf, args: &cli::Args) -> anyhow::Result
                 let dt = now.duration_since(last_tick).as_secs_f64().max(0.001);
                 last_tick = now;
 
-                match build_state(ebpf, args, &mut prev_iface, &mut prev_procs, dt) {
+                match build_state(ebpf, args, &mut prev_iface, &mut prev_procs, &mut prev_dropped, &mut prev_peek_dropped, dt) {
                     Ok(state) => {
                         if let Err(e) = terminal.draw(|f| tui::ui::draw(f, &state)) {
                             break Err(e.into());
@@ -149,8 +182,23 @@ fn build_state(
     args: &cli::Args,
     prev_iface: &mut IfaceCounters,
     prev_procs: &mut StdHashMap<u32, ProcTraffic>,
+    prev_dropped: &mut u64,
+    prev_peek_dropped: &mut u64,
     dt: f64,
 ) -> anyhow::Result<AppState> {
+    report_dropped_counter(
+        ebpf,
+        "PROC_TRAFFIC_DROPPED",
+        prev_dropped,
+        "PROC_TRAFFIC map full: {n} process(es) had traffic go unaccounted since last tick",
+    )?;
+    report_dropped_counter(
+        ebpf,
+        "UDP_RECV_PEEK_DROPPED",
+        prev_peek_dropped,
+        "UDP_RECV_PEEK map full: {n} MSG_PEEK read(s) may have been double-counted since last tick",
+    )?;
+
     let iface_map: PerCpuArray<_, IfaceCounters> = PerCpuArray::try_from(
         ebpf.map("IFACE_STATS").context("IFACE_STATS map missing")?,
     )?;
@@ -176,15 +224,19 @@ fn build_state(
     *prev_iface = cur_iface;
 
     let mut procs = Vec::new();
-    let mut seen: Vec<u32> = Vec::new();
+    // Reap dead pids so the fixed-capacity eBPF map doesn't fill up. Built
+    // directly in the loop below (rather than via a second full pass over
+    // every seen pid afterwards) so each pid's liveness is checked once,
+    // not twice.
+    let mut dead: Vec<u32> = Vec::new();
     {
         let proc_map: PerCpuHashMap<_, u32, ProcTraffic> = PerCpuHashMap::try_from(
             ebpf.map("PROC_TRAFFIC").context("PROC_TRAFFIC map missing")?,
         )?;
         for entry in proc_map.iter() {
             let (pid, per_cpu) = entry?;
-            seen.push(pid);
             if !proc_resolver::is_alive(pid) {
+                dead.push(pid);
                 continue;
             }
             let mut traffic = ProcTraffic::default();
@@ -217,11 +269,6 @@ fn build_state(
         }
     }
 
-    // Reap dead pids so the fixed-capacity eBPF map doesn't fill up.
-    let dead: Vec<u32> = seen
-        .into_iter()
-        .filter(|pid| !proc_resolver::is_alive(*pid))
-        .collect();
     if !dead.is_empty() {
         let mut proc_map_mut: PerCpuHashMap<_, u32, ProcTraffic> = PerCpuHashMap::try_from(
             ebpf.map_mut("PROC_TRAFFIC")

@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 netapp-common = { path = "../netapp-common", features = ["user"] }
 aya = { workspace = true, default-features = true }
-aya-log = { workspace = true, default-features = true }
 anyhow = { workspace = true, default-features = true }
 clap = { workspace = true }
 env_logger = { workspace = true, default-features = true }
