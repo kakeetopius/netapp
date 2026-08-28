@@ -8,8 +8,25 @@ RUSTC_BOOTSTRAP = { value = "netapp-ebpf", force = false }
 
 [target."cfg(all())"]
 # eBPF loading (kprobes/XDP/TC) needs root; this machine has no passwordless
-# sudo, so `cargo run` prompts interactively via sudo.
-runner = "sudo -E"
+# sudo, so `cargo run` prompts interactively via sudo. Cargo's `runner` has
+# no way to distinguish `cargo run` from `cargo test`/`cargo bench` for the
+# same target, so this inline script does that itself: only a binary whose
+# path ends in exactly "/netapp" -- the plain `[[bin]]` output from `cargo
+# build`/`cargo run` -- gets sudo'd. Test/bench binaries always get a
+# "-<hash>" suffix appended to that same name by cargo, so they fall
+# through untouched and need no root access.
+#
+# (A separate runner.sh file doesn't work here: cargo runs the runner with
+# cwd set to the manifest dir of whichever workspace member is being
+# built, not the workspace root, so a workspace-root-relative script path
+# doesn't resolve for every member. Matching on a `deps/` output dir also
+# doesn't work: depending on cargo version, `cargo test`'s binary can land
+# directly under `target/.../build/netapp/<hash>/out/` instead.)
+runner = [
+    "sh", "-c",
+    'case "$1" in */netapp) exec sudo -E "$@" ;; *) exec "$@" ;; esac',
+    "sh",
+]
 
 [unstable]
 # bpfel-unknown-none is a freestanding target with no libc, so LLVM's

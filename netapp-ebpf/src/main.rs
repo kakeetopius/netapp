@@ -3,11 +3,13 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, TC_ACT_PIPE},
+    helpers::bpf_get_current_pid_tgid,
     macros::{classifier, kprobe, kretprobe, map, xdp},
-    maps::{PerCpuArray, PerCpuHashMap},
+    maps::{HashMap, PerCpuArray, PerCpuHashMap},
     programs::{ProbeContext, RetProbeContext, TcContext, XdpContext},
     EbpfContext,
 };
+use aya_log_ebpf::warn;
 use netapp_common::{IfaceCounters, ProcTraffic};
 
 /// System-wide per-process traffic, keyed by TGID (the pid as seen in
@@ -53,14 +55,19 @@ const ZERO_TRAFFIC: ProcTraffic = ProcTraffic {
     udp_rx_bytes: 0,
 };
 
-fn ensure_entry(tgid: u32) {
-    if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none() {
-        let _ = PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0);
+fn ensure_entry(ctx: &impl EbpfContext, tgid: u32) {
+    if PROC_TRAFFIC.get_ptr_mut(&tgid).is_none()
+        && PROC_TRAFFIC.insert(&tgid, &ZERO_TRAFFIC, 0).is_err()
+    {
+        // Most likely the 10240-entry cap is full (heavy process churn
+        // between userspace reap passes). Made visible via the eBPF
+        // logger rather than silently dropping this tgid's traffic.
+        warn!(ctx, "PROC_TRAFFIC full, dropping tgid {}", tgid);
     }
 }
 
-fn update_tcp(tgid: u32, tx: u64, rx: u64) {
-    ensure_entry(tgid);
+fn update_tcp(ctx: &impl EbpfContext, tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(ctx, tgid);
     unsafe {
         if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
             (*p).tcp_tx_bytes += tx;
@@ -69,8 +76,8 @@ fn update_tcp(tgid: u32, tx: u64, rx: u64) {
     }
 }
 
-fn update_udp(tgid: u32, tx: u64, rx: u64) {
-    ensure_entry(tgid);
+fn update_udp(ctx: &impl EbpfContext, tgid: u32, tx: u64, rx: u64) {
+    ensure_entry(ctx, tgid);
     unsafe {
         if let Some(p) = PROC_TRAFFIC.get_ptr_mut(&tgid) {
             (*p).udp_tx_bytes += tx;
@@ -87,7 +94,7 @@ pub fn kretprobe_tcp_sendmsg(ctx: RetProbeContext) -> u32 {
     // not the requested size -- a failed/short send shouldn't count as TX.
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_tcp(ctx.tgid(), ret as u64, 0);
+        update_tcp(&ctx, ctx.tgid(), ret as u64, 0);
     }
     0
 }
@@ -97,7 +104,7 @@ pub fn kprobe_tcp_cleanup_rbuf(ctx: ProbeContext) -> u32 {
     // void tcp_cleanup_rbuf(struct sock *sk, int copied)
     if let Some(copied) = ctx.arg::<i32>(1) {
         if copied > 0 {
-            update_tcp(ctx.tgid(), 0, copied as u64);
+            update_tcp(&ctx, ctx.tgid(), 0, copied as u64);
         }
     }
     0
@@ -110,17 +117,48 @@ pub fn kretprobe_udp_sendmsg(ctx: RetProbeContext) -> u32 {
     // int udp_sendmsg(...); return value is bytes actually sent (or -errno).
     let ret: i32 = ctx.ret();
     if ret > 0 {
-        update_udp(ctx.tgid(), ret as u64, 0);
+        update_udp(&ctx, ctx.tgid(), ret as u64, 0);
+    }
+    0
+}
+
+/// MSG_PEEK, from `<linux/socket.h>`.
+const MSG_PEEK: i32 = 2;
+
+/// `udp_recvmsg`'s return value counts bytes copied to userspace even for a
+/// MSG_PEEK read, which doesn't dequeue the datagram -- the caller typically
+/// peeks it, then reads it again for real, and a naive kretprobe would count
+/// that datagram's bytes twice. This map lets the kretprobe below know
+/// whether the call it's returning from was a peek, keyed by pid_tgid (each
+/// thread's own in-flight call) since concurrent recvmsg calls from other
+/// threads/processes must not interfere with each other.
+#[map]
+static UDP_RECV_PEEK: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
+
+#[kprobe]
+pub fn kprobe_udp_recvmsg(ctx: ProbeContext) -> u32 {
+    // int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+    if let Some(flags) = ctx.arg::<i32>(3) {
+        if flags & MSG_PEEK != 0 {
+            let pid_tgid = bpf_get_current_pid_tgid();
+            let _ = UDP_RECV_PEEK.insert(&pid_tgid, &1u8, 0);
+        }
     }
     0
 }
 
 #[kretprobe]
 pub fn kretprobe_udp_recvmsg(ctx: RetProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let peeked = UDP_RECV_PEEK.get_ptr(&pid_tgid).is_some();
+    if peeked {
+        let _ = UDP_RECV_PEEK.remove(&pid_tgid);
+    }
+
     // int udp_recvmsg(...); return value is bytes received (or -errno)
     let ret: i32 = ctx.ret();
-    if ret > 0 {
-        update_udp(ctx.tgid(), 0, ret as u64);
+    if ret > 0 && !peeked {
+        update_udp(&ctx, ctx.tgid(), 0, ret as u64);
     }
     0
 }
