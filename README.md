@@ -71,9 +71,11 @@ pkexec tc qdisc del dev wlan0 clsact
 - Run something with an identifiable PID (`iperf3 -c <server>`, a long `curl`), cross-check via
   `pgrep`/`ss -tnp`, and confirm it shows up with nonzero traffic in the process table; confirm
   the row disappears a little after the process exits (reaping works).
-- Generate loopback traffic (`ping -c 5 127.0.0.1`) while monitoring `wlan0` — it should appear
-  in the process table but *not* move the interface panel, which demonstrates the
-  system-wide-vs-interface-scoped distinction described above.
+- Generate TCP/UDP loopback traffic (`iperf3 -s &` then `iperf3 -c 127.0.0.1 -t 10`) while
+  monitoring `wlan0` — it should appear in the process table but *not* move the interface panel,
+  which demonstrates the system-wide-vs-interface-scoped distinction described above. (Don't use
+  `ping` for this: ICMP never goes through the TCP/UDP functions netapp probes, so it won't show
+  up in the process table at all.)
 - While `netapp` is running: `pkexec bpftool prog list` / `pkexec bpftool link list` show its
   programs/links with `pids netapp(<pid>)` -- note their IDs. After quitting, those specific IDs
   should be gone (a bare "should show nothing left attached" isn't right on a system that already
